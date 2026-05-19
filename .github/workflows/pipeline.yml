@@ -1,0 +1,139 @@
+name: Full DevOps Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  # ================================================================
+  # 1. TERRAFORM INFRASTRUCTURE
+  # ================================================================
+  terraform:
+    name: Provision Infrastructure
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      instance_ips: ${{ steps.export.outputs.instance_ips }}
+      alb_dns: ${{ steps.export.outputs.alb_dns }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export Outputs
+        id: export
+        run: |
+          echo "=== Terraform Outputs ==="
+          terraform output
+          echo "========================"
+
+          IPS=$(terraform output -json instance_public_ips | jq -r '.[]' | paste -sd ',' -)
+          echo "IPs: $IPS"
+          echo "instance_ips=$IPS" >> "$GITHUB_OUTPUT"
+
+          DNS=$(terraform output -raw alb_dns_name)
+          echo "DNS: $DNS"
+          echo "alb_dns=$DNS" >> "$GITHUB_OUTPUT"
+
+  # ================================================================
+  # 2. ANSIBLE CONFIGURATION
+  # ================================================================
+  ansible:
+    name: Configure Servers
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Install Ansible 2.15
+        run: |
+          sudo apt-get install -y python3-pip
+          pip3 install ansible-core==2.15.12 --break-system-packages
+          ansible --version
+
+      - name: Setup SSH Key
+        run: |
+          echo "${{ secrets.EC2_KEY }}" > key.pem
+          chmod 600 key.pem
+
+      - name: Generate Inventory
+        run: |
+          echo "[web]" > inventory.ini
+          for ip in $(echo "${{ needs.terraform.outputs.instance_ips }}" | tr ',' ' '); do
+            echo "$ip ansible_user=ec2-user ansible_ssh_private_key_file=key.pem" >> inventory.ini
+          done
+          cat inventory.ini
+
+      - name: Run Ansible Deployment
+        run: ansible-playbook -i inventory.ini ansible/deploy.yml
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+
+      - name: Show Website URL
+        run: |
+          echo "============================================"
+          echo "🚀 Your website is live at:"
+          echo "http://${{ needs.terraform.outputs.alb_dns }}"
+          echo "============================================"
+
+  # ================================================================
+  # 3. OPTIONAL: TERRAFORM DESTROY (Manual)
+  # ================================================================
+  destroy:
+    name: Destroy Infrastructure (Manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
