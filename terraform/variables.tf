@@ -7,5 +7,5 @@ variable "aws_region" {
 variable "key_name" {
   description = "Name of the EXISTING SSH key pair in AWS (must already be created in the console)"
   type        = string
-  default     = "devops-key"
+  default     = "vockey"
 }
